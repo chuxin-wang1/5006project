@@ -20,17 +20,20 @@ st.caption("Interactive EDA first, followed by professional/statistical plots. S
 # -----------------------------
 # Data utilities (Updated with Caching)
 # -----------------------------
-# 使用缓存装饰器，避免每次交互都重新读取大文件
 @st.cache_data
 def load_data(file_source):
     # 定义需要的列，减少内存占用
     usecols = ["Date","Primary Type","Arrest","Domestic","Location Description","Latitude","Longitude"]
     
-    # 读取数据 (file_source 可以是路径字符串，也可以是上传的文件对象)
     try:
+        # 读取数据 (file_source 可以是路径字符串，也可以是上传的文件对象)
+        # 注意：如果是文件对象，pandas read_csv 会自动处理
         df = pd.read_csv(file_source, usecols=usecols)
     except ValueError:
         # 如果上传的文件列名不匹配，尝试读取所有列
+        # 重置文件指针位置（针对文件对象很重要）
+        if hasattr(file_source, 'seek'):
+            file_source.seek(0)
         df = pd.read_csv(file_source)
 
     # 预处理
@@ -52,6 +55,8 @@ def filter_by_year(df: pd.DataFrame, year_range: tuple[int,int]) -> pd.DataFrame
     return df[(df["Year"] >= year_range[0]) & (df["Year"] <= year_range[1])]
 
 def mark_holidays(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
     cal = USFederalHolidayCalendar()
     holidays = cal.holidays(start=df.index.min(), end=df.index.max())
     out = df.copy()
@@ -68,12 +73,11 @@ def mark_holidays(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -----------------------------
-# Sidebar: data source (Major Update)
+# Sidebar: data source
 # -----------------------------
 with st.sidebar:
     st.header("Data Source")
     
-    # 让用户选择数据源
     data_mode = st.radio(
         "Choose Data Source:",
         ["Use Demo Data (GitHub)", "Upload My Own File"]
@@ -83,7 +87,6 @@ with st.sidebar:
     
     if data_mode == "Use Demo Data (GitHub)":
         st.info("Using 'mini_data.csv' from repository.")
-        # 这里需要你确保 mini_data.csv 已经上传到了 GitHub
         if os.path.exists("mini_data.csv"):
             df = load_data("mini_data.csv")
         else:
@@ -91,7 +94,7 @@ with st.sidebar:
             st.stop()
             
     else:
-        st.write("Upload your 'Crimes_2001.csv' here.")
+        st.write("Upload your CSV file here.")
         uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
         
         if uploaded_file is not None:
@@ -101,13 +104,16 @@ with st.sidebar:
             st.warning("Please upload a CSV file to proceed.")
             st.stop()
 
-# sanity checks
-if df is not None:
-    required_cols = ["Primary Type", "Arrest", "Location Description"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"Your dataset is missing required columns: {missing}")
-        st.stop()
+# Sanity checks (Data Validation)
+if df is None or df.empty:
+    st.error("Dataframe is empty or failed to load. Please check your data source.")
+    st.stop()
+
+required_cols = ["Primary Type", "Arrest", "Location Description"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    st.error(f"Your dataset is missing required columns: {missing}")
+    st.stop()
 
 # -----------------------------
 # Pills: choose aspects
@@ -121,25 +127,53 @@ if not selected:
     st.stop()
 
 # -----------------------------
-# Common filters shown when Time is involved
+# Common filters (Fixed Logic Here)
 # -----------------------------
-year_range = (int(df["Year"].min()), int(df["Year"].max()))
-if "Time" in selected:
-    year_range = st.slider(
-        "Select Year Range",
-        int(df["Year"].min()),
-        int(df["Year"].max()),
-        (int(df["Year"].min()), int(df["Year"].max()))
-    )
+# 安全获取年份范围
+try:
+    min_year = int(df["Year"].min())
+    max_year = int(df["Year"].max())
+except ValueError:
+    st.error("Cannot determine Year range from data.")
+    st.stop()
 
+# 默认范围
+year_range = (min_year, max_year)
+
+# 只有当选择了 'Time' 并且最大最小年份不一致时，才显示 Slider
+if "Time" in selected:
+    if min_year == max_year:
+        st.warning(f"Dataset contains only one year of data: {min_year}. Slider disabled.")
+        year_range = (min_year, max_year)
+    else:
+        year_range = st.slider(
+            "Select Year Range",
+            min_value=min_year,
+            max_value=max_year,
+            value=(min_year, max_year)
+        )
+
+# 应用过滤
 df_filtered = filter_by_year(df, year_range)
 
-# optional category filter
+if df_filtered.empty:
+    st.warning("No data available for the selected time range.")
+    st.stop()
+
+# Optional category filter
 top_types = df_filtered["Primary Type"].value_counts().nlargest(10).index.tolist()
+if not top_types:
+    st.warning("No crime types found.")
+    st.stop()
+
 crime_filter = st.multiselect("Crime types (optional)", options=sorted(df_filtered["Primary Type"].unique()),
                              default=top_types[:5])
 if crime_filter:
     df_filtered = df_filtered[df_filtered["Primary Type"].isin(crime_filter)]
+
+if df_filtered.empty:
+    st.warning("No data available after applying Category filters.")
+    st.stop()
 
 # -----------------------------
 # Helper: interactive charts (Plotly)
@@ -204,7 +238,13 @@ def plot_acf_professional(df_, mode="raw", lags=60):
     if daily.empty:
         st.warning("Not enough daily data for ACF.")
         return
-    vals = acf(daily.values, nlags=lags, fft=True)
+    # 动态调整 lags，防止数据太少时报错
+    safe_lags = min(lags, len(daily) // 2 - 1)
+    if safe_lags < 1:
+        st.warning("Not enough data points to calculate ACF.")
+        return
+
+    vals = acf(daily.values, nlags=safe_lags, fft=True)
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.bar(np.arange(len(vals)), vals)
     ax.axhline(0, linewidth=1)
@@ -216,8 +256,17 @@ def plot_acf_professional(df_, mode="raw", lags=60):
 def plot_holiday_professional(df_):
     dfh = mark_holidays(df_)
     top5 = dfh["Primary Type"].value_counts().nlargest(5).index
+    if len(top5) == 0:
+        st.warning("Not enough data for holiday analysis.")
+        return
+        
     subset = dfh[dfh["Primary Type"].isin(top5)]
     comp = subset.groupby(["Period_Type","Primary Type"]).size().unstack(fill_value=0)
+    
+    if comp.empty:
+        st.warning("No data for holiday composition.")
+        return
+
     comp_pct = comp.div(comp.sum(axis=1), axis=0)
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -229,15 +278,22 @@ def plot_holiday_professional(df_):
 
     # Hourly pulse holiday vs normal
     fig2, ax2 = plt.subplots(figsize=(10, 4))
+    plotted = False
     for p_type in ["Holiday Day", "Normal Day"]:
         data = dfh[dfh["Period_Type"] == p_type]
-        hourly = data["Hour"].value_counts(normalize=True).sort_index()
-        ax2.plot(hourly.index, hourly.values, linewidth=2.5, label=p_type)
-    ax2.set_title("Hourly pulse: Holiday Day vs Normal Day")
-    ax2.set_xlabel("Hour")
-    ax2.set_ylabel("Probability density")
-    ax2.legend()
-    st_mpl(fig2)
+        if not data.empty:
+            hourly = data["Hour"].value_counts(normalize=True).sort_index()
+            ax2.plot(hourly.index, hourly.values, linewidth=2.5, label=p_type)
+            plotted = True
+            
+    if plotted:
+        ax2.set_title("Hourly pulse: Holiday Day vs Normal Day")
+        ax2.set_xlabel("Hour")
+        ax2.set_ylabel("Probability density")
+        ax2.legend()
+        st_mpl(fig2)
+    else:
+        st.write("Insufficient data for Hourly Pulse plot.")
 
 # -----------------------------
 # UI rendering
@@ -258,10 +314,13 @@ if len(selected) == 1:
         with t2:
             top5 = df_filtered["Primary Type"].value_counts().nlargest(5).index
             sub = df_filtered[df_filtered["Primary Type"].isin(top5)]
-            hourly = sub.groupby(["Hour","Primary Type"]).size().reset_index(name="Total")
-            fig = px.line(hourly, x="Hour", y="Total", color="Primary Type", markers=True,
-                          title="When do specific crimes happen? (Top-5)")
-            st.plotly_chart(fig, use_container_width=True)
+            if not sub.empty:
+                hourly = sub.groupby(["Hour","Primary Type"]).size().reset_index(name="Total")
+                fig = px.line(hourly, x="Hour", y="Total", color="Primary Type", markers=True,
+                              title="When do specific crimes happen? (Top-5)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough data for hourly patterns.")
 
         with t3:
             plot_acf_professional(df_filtered, mode="raw", lags=60)
@@ -280,22 +339,24 @@ if len(selected) == 1:
             # professional: stacked ratio + absolute counts (Top-5)
             top5 = df_filtered["Primary Type"].value_counts().nlargest(5).index
             df_top5 = df_filtered[df_filtered["Primary Type"].isin(top5)]
-            counts = df_top5.groupby(["Year","Primary Type"]).size().unstack(fill_value=0)
-            ratio = counts.div(counts.sum(axis=1), axis=0)
+            
+            if not df_top5.empty:
+                counts = df_top5.groupby(["Year","Primary Type"]).size().unstack(fill_value=0)
+                ratio = counts.div(counts.sum(axis=1), axis=0)
 
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ratio.plot(kind="area", stacked=True, ax=ax, alpha=0.8)
-            ax.set_title("Crime type structure over time (Top-5, stacked area)")
-            ax.set_ylabel("Proportion")
-            ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
-            st_mpl(fig)
+                fig, ax = plt.subplots(figsize=(10, 5))
+                ratio.plot(kind="area", stacked=True, ax=ax, alpha=0.8)
+                ax.set_title("Crime type structure over time (Top-5, stacked area)")
+                ax.set_ylabel("Proportion")
+                ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+                st_mpl(fig)
 
-            fig2, ax2 = plt.subplots(figsize=(10, 4))
-            counts.plot(ax=ax2, linewidth=2)
-            ax2.set_title("Crime counts by type over time (Top-5)")
-            ax2.set_ylabel("Count")
-            ax2.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
-            st_mpl(fig2)
+                fig2, ax2 = plt.subplots(figsize=(10, 4))
+                counts.plot(ax=ax2, linewidth=2)
+                ax2.set_title("Crime counts by type over time (Top-5)")
+                ax2.set_ylabel("Count")
+                ax2.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+                st_mpl(fig2)
 
     elif only == "Location":
         st.header("Location EDA")
@@ -309,17 +370,18 @@ if len(selected) == 1:
         with a2:
             top5 = df_filtered["Primary Type"].value_counts().nlargest(5).index
             df_top5 = df_filtered[df_filtered["Primary Type"].isin(top5)]
-            ar = df_top5.groupby(["Year","Primary Type"])["Arrest"].mean().unstack()
+            if not df_top5.empty:
+                ar = df_top5.groupby(["Year","Primary Type"])["Arrest"].mean().unstack()
 
-            fig, ax = plt.subplots(figsize=(10, 5))
-            for ct in top5:
-                if ct in ar.columns:
-                    ax.plot(ar.index, ar[ct], marker="s", linewidth=2, label=ct)
-            ax.set_title("Arrest rate by type (Top-5)")
-            ax.set_xlabel("Year")
-            ax.set_ylabel("Arrest rate")
-            ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
-            st_mpl(fig)
+                fig, ax = plt.subplots(figsize=(10, 5))
+                for ct in top5:
+                    if ct in ar.columns:
+                        ax.plot(ar.index, ar[ct], marker="s", linewidth=2, label=ct)
+                ax.set_title("Arrest rate by type (Top-5)")
+                ax.set_xlabel("Year")
+                ax.set_ylabel("Arrest rate")
+                ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+                st_mpl(fig)
 
 # Two-pill combinations
 elif len(selected) == 2:
