@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 import plotly.express as px
 from pandas.tseries.holiday import USFederalHolidayCalendar
@@ -17,12 +18,22 @@ st.title("Chicago Crime EDA Dashboard")
 st.caption("Interactive EDA first, followed by professional/statistical plots. Spatial Moran/Gi* loaded from a precomputed grid.")
 
 # -----------------------------
-# Data utilities
+# Data utilities (Updated with Caching)
 # -----------------------------
-def load_mini_data_csv(csv_path: str) -> pd.DataFrame:
+# 使用缓存装饰器，避免每次交互都重新读取大文件
+@st.cache_data
+def load_data(file_source):
+    # 定义需要的列，减少内存占用
     usecols = ["Date","Primary Type","Arrest","Domestic","Location Description","Latitude","Longitude"]
-    df = pd.read_csv(csv_path, usecols=usecols).sample(1000)
+    
+    # 读取数据 (file_source 可以是路径字符串，也可以是上传的文件对象)
+    try:
+        df = pd.read_csv(file_source, usecols=usecols)
+    except ValueError:
+        # 如果上传的文件列名不匹配，尝试读取所有列
+        df = pd.read_csv(file_source)
 
+    # 预处理
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).set_index("Date")
 
@@ -34,54 +45,8 @@ def load_mini_data_csv(csv_path: str) -> pd.DataFrame:
 
     df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
     df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
+    
     return df
-
-def load_big_data_csv(csv_path: str) -> pd.DataFrame:
-    usecols = ["Date","Primary Type","Arrest","Domestic","Location Description","Latitude","Longitude"]
-    df = pd.read_csv(csv_path, usecols=usecols)
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).set_index("Date")
-
-    df["Year"] = df.index.year
-    df["Month"] = df.index.month
-    df["Hour"] = df.index.hour
-    df["DayOfWeek"] = df.index.day_name()
-    df["DayNum"] = df.index.dayofweek
-
-    df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
-    df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
-    return df
-
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure datetime index
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date")
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df.dropna(subset=[df.index.name] if df.index.name else None)
-
-    # Core features
-    df["Year"] = df.index.year
-    df["Month"] = df.index.month
-    df["Hour"] = df.index.hour
-    df["DayOfWeek"] = df.index.day_name()
-    df["DayNum"] = df.index.dayofweek
-
-    # Clean lat/lon
-    if LAT_COL in df.columns and LON_COL in df.columns:
-        df[LAT_COL] = pd.to_numeric(df[LAT_COL], errors="coerce")
-        df[LON_COL] = pd.to_numeric(df[LON_COL], errors="coerce")
-
-    return df
-
-def load_csv(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
-    return preprocess(df)
-
-def load_spatial_grid(path="spatial_grid_precomputed.csv") -> pd.DataFrame:
-    return pd.read_csv(path)
 
 def filter_by_year(df: pd.DataFrame, year_range: tuple[int,int]) -> pd.DataFrame:
     return df[(df["Year"] >= year_range[0]) & (df["Year"] <= year_range[1])]
@@ -103,28 +68,46 @@ def mark_holidays(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -----------------------------
-# Sidebar: data source
+# Sidebar: data source (Major Update)
 # -----------------------------
 with st.sidebar:
-    st.header("Data")
-    use_mini = st.checkbox("Use mini test data", value=True)
-    st.write('else it would use dataset from 2001 to present, it would take 1-2 minutes to making the graph for different pill chosed')
-    st.divider()
-    st.header("Chicago 2001 Dataset Path")
-    st.caption("Expected file: ~/Crimes_2001.csv")
-    data_path = st.text_input("Dataset path", value="/Users/ziyi/Downloads/Crimes_2001.csv")
-
-if use_mini:
-    df = load_mini_data_csv(data_path)
-else:
-    df = load_big_data_csv(data_path)
+    st.header("Data Source")
+    
+    # 让用户选择数据源
+    data_mode = st.radio(
+        "Choose Data Source:",
+        ["Use Demo Data (GitHub)", "Upload My Own File"]
+    )
+    
+    df = None
+    
+    if data_mode == "Use Demo Data (GitHub)":
+        st.info("Using 'mini_data.csv' from repository.")
+        # 这里需要你确保 mini_data.csv 已经上传到了 GitHub
+        if os.path.exists("mini_data.csv"):
+            df = load_data("mini_data.csv")
+        else:
+            st.error("Demo file 'mini_data.csv' not found in repository! Please upload it to GitHub.")
+            st.stop()
+            
+    else:
+        st.write("Upload your 'Crimes_2001.csv' here.")
+        uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+        
+        if uploaded_file is not None:
+            with st.spinner("Loading and processing data..."):
+                df = load_data(uploaded_file)
+        else:
+            st.warning("Please upload a CSV file to proceed.")
+            st.stop()
 
 # sanity checks
-required_cols = ["Primary Type", "Arrest", "Location Description"]
-missing = [c for c in required_cols if c not in df.columns]
-if missing:
-    st.error(f"Your dataset is missing required columns: {missing}")
-    st.stop()
+if df is not None:
+    required_cols = ["Primary Type", "Arrest", "Location Description"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Your dataset is missing required columns: {missing}")
+        st.stop()
 
 # -----------------------------
 # Pills: choose aspects
@@ -254,34 +237,6 @@ def plot_holiday_professional(df_):
     ax2.set_xlabel("Hour")
     ax2.set_ylabel("Probability density")
     ax2.legend()
-    st_mpl(fig2)
-
-def plot_moran_professional(grid_df):
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    hb = ax.hexbin(grid_df["z_standardized"], grid_df["lag"], gridsize=70, bins="log", mincnt=1, linewidths=0)
-    fig.colorbar(hb, ax=ax, shrink=0.9).set_label("log10(count)")
-    ax.axhline(0, linewidth=1)
-    ax.axvline(0, linewidth=1)
-    ax.set_title("Moran Scatter (precomputed grid)")
-    ax.set_xlabel("Standardized cell count (z)")
-    ax.set_ylabel("Spatial lag (rook mean)")
-    st_mpl(fig)
-
-def plot_gistar_professional(grid_df):
-    # classification map (scatter as a fast “raster-like” view)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    sc = ax.scatter(grid_df["lon"], grid_df["lat"], c=grid_df["Gi_cat"], s=6)
-    ax.set_title("Gi* Hotspot/Coldspot classes (precomputed)")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    st_mpl(fig)
-
-    # Gi* z values
-    fig2, ax2 = plt.subplots(figsize=(7, 6))
-    sc2 = ax2.scatter(grid_df["lon"], grid_df["lat"], c=grid_df["Gi_z"], s=6)
-    ax2.set_title("Gi* z-scores (precomputed)")
-    ax2.set_xlabel("Longitude")
-    ax2.set_ylabel("Latitude")
     st_mpl(fig2)
 
 # -----------------------------
